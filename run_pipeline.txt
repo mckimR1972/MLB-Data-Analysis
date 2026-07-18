@@ -1,0 +1,12 @@
+@echo off
+:: run_pipeline.bat
+:: 파이썬 경로와 스크립트 경로를 본인 환경에 맞게 수정
+
+cd /d C:\Users\mirmi\OneDrive\바탕 화면\MLB_Analysis
+"C:\Users\mirmi\AppData\Local\Programs\Python\Python313\python.exe" statcast_pipeline.py
+
+:: 에러 발생 시 로그 확인용으로 잠시 대기 (선택)
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] 파이프라인 실패 — 로그 확인 필요
+    pause
+)
