@@ -924,10 +924,21 @@ def my_model(df: pd.DataFrame):
         'BATTER_ZONE_SWING', 'BATTER_CHASE_RATE'
     ]
 
-    base_df = rhp[rhp['PITCHER'] != 695243].copy()
+    non_miller_df = rhp[rhp['PITCHER'] != 695243].copy()
     miller_df = rhp[rhp['PITCHER'] == 695243].copy()
 
-    # ── 모델링 ──
+    # 밀러 데이터 분리 
+    X_miller = miller_df[model_features].copy()
+    X_miller['STAND'] = (miller_df['STAND'] == 'R').astype(int)
+    y_miller = miller_df['DID_SWING']
+
+    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(
+        X_miller, y_miller, test_size=.3, random_state=42
+    )
+
+    # 베이스 학습 : non-밀러 전체 + 밀러 train 데이터
+    base_df = pd.concat([non_miller_df, miller_df.loc[X_m_train.index]])
+
     X = base_df[model_features].copy()
     X['STAND'] = (base_df['STAND'] == 'R').astype(int)
     y = base_df['DID_SWING']
@@ -957,26 +968,6 @@ def my_model(df: pd.DataFrame):
     print(f"Test score:  {lgbm.score(X_test, y_test):.4f}")
     print(metrics.classification_report(y_test, y_hat))
 
-
-    # ============================================
-    # 전이 학습: Mason Miller
-    # ============================================
-
-    # ── Miller 데이터 추출 (동일한 전처리 적용) ──
-    
-    print(f"Miller 전체 투구 수: {len(miller_df)}")
-    print(f"Miller 스윙 비율:")
-    print(miller_df['DID_SWING'].value_counts(normalize=True))
-
-    # ── Miller 데이터로 fine-tune ──
-    X_miller = miller_df[model_features].copy()
-    X_miller['STAND'] = (miller_df['STAND'] == 'R').astype(int)
-    y_miller = miller_df['DID_SWING']
-
-    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(
-        X_miller, y_miller, test_size=.3, random_state=42
-    )
-
     # ===================================== 
     # 전이 학습 (base → Miller fine-tune)   
     # =====================================
@@ -998,27 +989,27 @@ def my_model(df: pd.DataFrame):
     print(f"Score: {fine_model.score(X_m_test, y_m_test):.4f}")
     print(metrics.classification_report(y_m_test, y_hat_fine))
 
-    # ================
-    # 단순 블렌딩 기법  
-    # ================
+    # # ================
+    # # 단순 블렌딩 기법  
+    # # ================
     
-    base_prob_miller = lgbm.predict_proba(X_m_test)[:, 1]
-    fine_prob_miller = fine_model.predict_proba(X_m_test)[:, 1]
+    # base_prob_miller = lgbm.predict_proba(X_m_test)[:, 1]
+    # fine_prob_miller = fine_model.predict_proba(X_m_test)[:, 1]
 
-    alpha = .4
-    blend_prob = (base_prob_miller * alpha) + (fine_prob_miller * (1-alpha))
-    blend_pred = (blend_prob >= 0.5).astype(int)
+    # alpha = .4
+    # blend_prob = (base_prob_miller * alpha) + (fine_prob_miller * (1-alpha))
+    # blend_pred = (blend_prob >= 0.5).astype(int)
 
-    print("\n=== [최종] 베이스 & 밀러 파인튜닝 블렌딩 앙상블 결과 ===")
-    print(f"Blending Test Score: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
-    print(metrics.classification_report(y_m_test, blend_pred))
+    # print("\n=== [최종] 베이스 & 밀러 파인튜닝 블렌딩 앙상블 결과 ===")
+    # print(f"Blending Test Score: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
+    # print(metrics.classification_report(y_m_test, blend_pred))
 
-    # ── 개별 모델 성능 레포트 비교용 출력 ──
-    print("=== 모델별 밀러 테스트셋 단독 Accuracy 비교 ===")
-    base_invert_score = metrics.accuracy_score(y_m_test, (base_prob_miller >= 0.5).astype(int))
-    print(f"1. 순수 베이스 모델이 예측한 밀러 점수: {base_invert_score:.4f}")
-    print(f"2. 파인튜닝 단독 모델이 예측한 밀러 점수: {fine_model.score(X_m_test, y_m_test):.4f}")
-    print(f"3. 두 모델을 섞은 블렌딩 앙상블 점수: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
+    # # ── 개별 모델 성능 레포트 비교용 출력 ──
+    # print("=== 모델별 밀러 테스트셋 단독 Accuracy 비교 ===")
+    # base_invert_score = metrics.accuracy_score(y_m_test, (base_prob_miller >= 0.5).astype(int))
+    # print(f"1. 순수 베이스 모델이 예측한 밀러 점수: {base_invert_score:.4f}")
+    # print(f"2. 파인튜닝 단독 모델이 예측한 밀러 점수: {fine_model.score(X_m_test, y_m_test):.4f}")
+    # print(f"3. 두 모델을 섞은 블렌딩 앙상블 점수: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
     
     # # ============
     # # 앙상블 기법 

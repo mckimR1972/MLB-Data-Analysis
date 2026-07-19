@@ -27,53 +27,35 @@ import time
 # ══════════════════════════════════════════════════════════
 
 DB_USER = "C##AKSEN"
-DB_PASS = "020304"
+DB_PASS = "1234"
 DB_DSN  = "localhost:1521/xe"
 TABLE_NAME = "TMP_TABLE"
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, f"pipeline_{datetime.now():%Y%m}.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    encoding="utf-8",
-    handlers=[
-        logging.FileHandler(
-            os.path.join(LOG_DIR, f"pipeline_{datetime.now():%Y%m}.log"),
-            encoding="utf-8",
-        ),
-        logging.StreamHandler(),  # 콘솔에도 동시 출력
-    ],
-)
-# basicConfig의 handlers와 filename 충돌 방지를 위해 재설정
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-if not logger.handlers:
-    fh = logging.FileHandler(
-        os.path.join(LOG_DIR, f"pipeline_{datetime.now():%Y%m}.log"),
-        encoding="utf-8",
-    )
-    sh = logging.StreamHandler()
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    fh.setFormatter(fmt)
-    sh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
+
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+fh = logging.FileHandler(
+    os.path.join(LOG_DIR, f"pipeline_{datetime.now():%Y%m}.log"),
+    encoding="utf-8",
+)
+fh.setFormatter(fmt)
+logger.addHandler(fh)
+
+sh = logging.StreamHandler()
+sh.setFormatter(fmt)
+logger.addHandler(sh)
 
 
 # ══════════════════════════════════════════════════════════
 # pybaseball → TMP_TABLE 컬럼 매핑
 # ══════════════════════════════════════════════════════════
-# pybaseball의 statcast()가 반환하는 컬럼명(소문자)
-# → Oracle TMP_TABLE 컬럼명(대문자) 매핑
-#
-# 대부분은 단순 대문자 변환이지만,
-# 이름 자체가 다른 컬럼들이 있어서 명시적 rename이 필요합니다.
 
 COLUMN_RENAME = {
-    # pybaseball 컬럼명     →  Oracle TMP_TABLE 컬럼명
     "description":                    "PITCH_DESCRIPTION",
     "events":                         "PITCH_EVENTS",
     "type":                           "SBX_TYPE",
@@ -82,7 +64,6 @@ COLUMN_RENAME = {
     "delta_home_win_exp":             "HOME_WIN_EXP",
 }
 
-# TMP_TABLE에 존재하는 66개 컬럼 (순서 보존)
 TABLE_COLUMNS = [
     "PITCH_TYPE", "RELEASE_SPEED", "RELEASE_POS_X", "RELEASE_POS_Y",
     "RELEASE_POS_Z", "RELEASE_SPIN_RATE", "PFX_X", "PFX_Z",
@@ -108,9 +89,7 @@ TABLE_COLUMNS = [
     "INTERCEPT_X", "INTERCEPT_Y", "SWING_PATH_TILT",
 ]
 
-# PK 컬럼
 PK_COLUMNS = ["GAME_PK", "AT_BAT_NUMBER", "PITCH_NUMBER"]
-
 
 
 # ══════════════════════════════════════════════════════════
@@ -133,8 +112,9 @@ def fetch_statcast_data(target_date: str) -> pd.DataFrame:
     logger.info(f"[FETCH] {target_date} 데이터 수집 시작...")
 
     try:
-        df = statcast(start_dt='2026-03-01', end_dt=target_date)
-        df = df[df['game_type'] == 'R']
+        df = statcast(start_dt=target_date, end_dt=target_date)
+        if 'game_type' in df.columns:
+            df = df[df['game_type'] == 'R']
     except Exception as e:
         logger.error(f"[FETCH] API 호출 실패: {e}")
         return pd.DataFrame()
@@ -152,8 +132,10 @@ def fetch_statcast_data(target_date: str) -> pd.DataFrame:
     df.columns = [c.upper() if c not in COLUMN_RENAME.values() else c
                   for c in df.columns]
 
+    # ── Step 2.5: 중복 컬럼 제거 ──
+    df = df.loc[:, ~df.columns.duplicated()]
+
     # ── Step 3: TMP_TABLE에 있는 컬럼만 추출 (순서 맞춤) ──
-    # 테이블에는 있지만 API에 없는 컬럼 → NaN으로 채움
     for col in TABLE_COLUMNS:
         if col not in df.columns:
             df[col] = np.nan
@@ -162,11 +144,9 @@ def fetch_statcast_data(target_date: str) -> pd.DataFrame:
     df = df[TABLE_COLUMNS].copy()
 
     # ── Step 4: 타입 정리 ──
-    # GAME_DATE: datetime → date
     if "GAME_DATE" in df.columns:
-        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"]).dt.date
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
 
-    # 정수형 컬럼: float → int (NaN이 있으면 유지)
     int_cols = [
         "RELEASE_SPIN_RATE", "BATTER", "PITCHER", "GAME_PK",
         "STRIKES", "BALLS", "OUTS_WHEN_UP",
@@ -184,10 +164,16 @@ def fetch_statcast_data(target_date: str) -> pd.DataFrame:
     # ── Step 5: PK 컬럼에 NULL이 있는 행 제거 ──
     before = len(df)
     df = df.dropna(subset=PK_COLUMNS)
+    null_dropped = before - len(df)
+    if null_dropped > 0:
+        logger.warning(f"[FETCH] PK 컬럼 NULL → {null_dropped}행 제거")
+
+    # ── Step 6: DataFrame 내 PK 중복 제거 ──
+    before = len(df)
     df = df.drop_duplicates(subset=PK_COLUMNS, keep="last")
-    dropped = before - len(df)
-    if dropped > 0:
-        logger.warning(f"[FETCH] PK 컬럼 NULL → {dropped}행 제거")
+    dup_dropped = before - len(df)
+    if dup_dropped > 0:
+        logger.warning(f"[FETCH] PK 중복 → {dup_dropped}행 제거")
 
     # PK 컬럼을 정수로 확정
     for col in PK_COLUMNS:
@@ -200,7 +186,6 @@ def fetch_statcast_data(target_date: str) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════
 # DB 적재
 # ══════════════════════════════════════════════════════════
-
 
 def insert_to_oracle(df: pd.DataFrame):
     """
@@ -215,12 +200,8 @@ def insert_to_oracle(df: pd.DataFrame):
     cursor = conn.cursor()
 
     try:
-        # ── MERGE SQL 생성 ──
-        # MERGE는 PK 기준으로 존재 여부를 판단해서
-        # 있으면 UPDATE, 없으면 INSERT 합니다.
         non_pk_cols = [c for c in TABLE_COLUMNS if c not in PK_COLUMNS]
 
-        # 바인드 변수 매핑: :1, :2, ... (TABLE_COLUMNS 순서)
         bind_map = {col: f":{i+1}" for i, col in enumerate(TABLE_COLUMNS)}
 
         merge_sql = f"""
@@ -237,13 +218,12 @@ def insert_to_oracle(df: pd.DataFrame):
                 VALUES ({', '.join(f'src.{c}' for c in TABLE_COLUMNS)})
         """
 
-        # ── 데이터 변환: NaN → None ──
+        # ── 데이터 변환: NaN / pd.NA → None ──
         data = []
-        for _, row in df.iterrows():
+        for row in df.itertuples(index=False):
             record = []
-            for col in TABLE_COLUMNS:
-                val = row[col]
-                if pd.isna(val):
+            for val in row:
+                if val is None or val is pd.NA or (isinstance(val, float) and np.isnan(val)):
                     record.append(None)
                 elif isinstance(val, (np.integer,)):
                     record.append(int(val))
@@ -290,7 +270,12 @@ def get_existing_dates() -> set:
     cursor = conn.cursor()
     try:
         cursor.execute(f"SELECT DISTINCT GAME_DATE FROM {TABLE_NAME}")
-        dates = {row[0] for row in cursor.fetchall()}
+        dates = set()
+        for row in cursor.fetchall():
+            d = row[0]
+            if isinstance(d, datetime):
+                d = d.date()
+            dates.add(d)
         return dates
     except Exception:
         return set()
@@ -335,7 +320,6 @@ def run_daily():
             last_date = max(existing_dates)
             yesterday_date = datetime.strptime(yesterday, "%Y-%m-%d").date()
 
-            # 마지막 적재일 ~ 어제 사이에 빈 날짜 탐색
             current = last_date + timedelta(days=1)
             missing = []
             while current <= yesterday_date:
@@ -348,7 +332,7 @@ def run_daily():
                             f"{missing[0]} ~ {missing[-1]}")
                 for d in missing:
                     run_single_date(d)
-                    time.sleep(5)  # API 부하 방지
+                    time.sleep(5)
             else:
                 logger.info("[BACKFILL] 빠진 날짜 없음")
     except Exception as e:
@@ -380,7 +364,7 @@ def run_backfill(start_date: str, end_date: str):
         else:
             count = run_single_date(date_str)
             total += count
-            time.sleep(5)  # Baseball Savant 서버 부하 방지
+            time.sleep(5)
 
         current += timedelta(days=1)
 
