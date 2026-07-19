@@ -9,9 +9,18 @@ import missingno as msno
 
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold, cross_val_score
+from sklearn import metrics
 from sklearn.metrics import mean_squared_error, mean_absolute_error, root_mean_squared_error
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, AdaBoostClassifier
+
+non_ab_events = [
+    "walk", "intent_walk", "hit_by_pitch",
+    "sac_fly", "sac_bunt", "sac_fly_double_play",
+    "catcher_interf" 
+]
+hit_for_run_events = ["single", "double", "triple", "home_run"]
 
 def hit_distance_analysis(df:pd.DataFrame):
     df = df[
@@ -470,7 +479,7 @@ def pitch_type_classification(df:pd.DataFrame):
     plt.title('Permutation Feature Importance')
     plt.show()
 
-def boosting(df: pd.DataFrame):
+def boosting(df: pd.DataFrame) -> GradientBoostingClassifier:
     features = ['SPIN_AXIS', 'AX', 'AY', 'AZ', 'RELEASE_SPEED']
     df = df.dropna(subset=features + ['PITCH_TYPE'])
     df = df[~(df['PITCH_TYPE'].isin(['PO', 'UN']))]
@@ -495,7 +504,6 @@ def boosting(df: pd.DataFrame):
     y = df['CLASS'] 
 
     from sklearn.model_selection import train_test_split
-    from sklearn.ensemble import GradientBoostingClassifier, AdaBoostClassifier
     from sklearn import metrics
     from sklearn import tree 
 
@@ -540,6 +548,555 @@ def boosting(df: pd.DataFrame):
     print(f"Train: {round(gb.score(X_train, y_train), 3)}")
     print(f"Test: {round(gb.score(X_test, y_test), 3)}")
 
+    return gb 
+
+def Masson_Miller(df:pd.DataFrame): 
+    mm_origin = df[df['PITCHER'] == 695243]
+    mm_origin['SEASON'] = pd.to_datetime(mm_origin['GAME_DATE']).dt.year
+    mm_origin = mm_origin.sort_values(by=['GAME_PK', 'AT_BAT_NUMBER', 'PITCH_NUMBER'], ascending=[True, True, True]).reset_index(drop=True)
+    
+    # =======================================
+    # 1. 구종 통게
+    # =======================================
+    mm = mm_origin.copy()
+
+    event = mm[mm['PITCH_EVENTS'].notna()]
+    event['IS_AB'] = np.where(
+        (event['PITCH_EVENTS'].notna()) & ~(event['PITCH_EVENTS'].isin([non_ab_events])),
+        1, 0
+    )
+    event['IS_HIT_FOR_RUN'] = np.where(
+        event['PITCH_EVENTS'].isin(hit_for_run_events), 1, 0
+    )
+    condlist = [
+        event['PITCH_EVENTS'] == 'single',
+        event['PITCH_EVENTS'] == 'double',
+        event['PITCH_EVENTS'] == 'triple',
+        event['PITCH_EVENTS'] == 'home_run'
+    ]
+    event['HIT_FOR_BASE'] = np.select(condlist, [1,2,3,4], default=0)
+
+    event = event.groupby(['PITCH_TYPE', 'SEASON']).agg(
+        AB = ('IS_AB', 'sum'),
+        HIT_FOR_RUN=('IS_HIT_FOR_RUN', 'sum'),
+        RUN_BASE = ('HIT_FOR_BASE', 'sum')
+    )
+    event['OBP'] = round(event['HIT_FOR_RUN'] / event['AB'], 3)
+    event['OSLG'] = round(event['RUN_BASE'] / event['AB'], 3)
+
+    mm = mm.groupby(['PITCH_TYPE', 'SEASON']).agg(
+            COUNT = ('RELEASE_SPEED', 'count'),
+            SPEED_AVG = ('RELEASE_SPEED', 'mean'),
+    )
+    mm['SPEED_AVG'] = round(mm['SPEED_AVG'], 1)
+    mm['RATIO'] = round(mm['COUNT'] / mm.groupby('SEASON')['COUNT'].transform('sum') * 100, 1).astype(str) + "%"
+    res = pd.merge(
+        left=mm, right=event, how='inner',
+        left_index=True, right_index=True
+    )
+
+    print(res)
+    mask = (mm_origin['PITCH_TYPE'] == 'FF') & (mm_origin['SEASON'] == 2025)
+    subset = mm_origin[mask]
+
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import Rectangle
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+
+    for ax, year, title in zip(axes, [2025, 2026], ['2025 Slider', '2026 Slider']):
+        subset = mm_origin[
+            (mm_origin['PITCH_TYPE'] == 'SL') & (mm_origin['SEASON'] == year)
+        ].dropna(subset=['PLATE_X', 'PLATE_Z'])
+
+        sns.kdeplot(
+            data=subset,
+            x='PLATE_X', y='PLATE_Z',
+            cmap='hot_r',          # 빨강→노랑→흰색 (이미지와 유사)
+            fill=True,
+            levels=100,             # 등고선 수를 높여서 부드럽게
+            thresh=0.2,           # 밀도 낮은 외곽을 자연스럽게 페이드
+            ax=ax,
+            alpha=0.9,
+        )
+
+        # 스트라이크존 사각형 (피트 단위)
+        sz = Rectangle(
+            (-0.833, 1.5), 1.666, 2.0,
+            fill=False, edgecolor='black', linewidth=2, zorder=10
+        )
+        ax.add_patch(sz)
+
+        ax.set_xlim(-2.5, 2.5)
+        ax.set_ylim(0, 5)
+        ax.set_xlabel('PLATE_X (CAPCHER VIEW)')
+        ax.set_ylabel('PLATE_Z')
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_aspect('equal')
+
+    plt.tight_layout()
+    plt.show()
+
+    mm = mm_origin.copy()
+    mm['PREV_PITCH_TYPE'] = mm.groupby(['GAME_PK','AT_BAT_NUMBER'])['PITCH_TYPE'].shift(1)
+    transition = pd.crosstab(
+        mm['PREV_PITCH_TYPE'],
+        mm['PITCH_TYPE'],
+        normalize='index'
+    )
+    print(transition)
+
+def calc_decision_point(df:pd.DataFrame):
+    """
+    스윙 결정 시점(t=0.25초)에서의 보정된 x, y, z 좌표 계산
+    
+    Parameters:
+        df: PITCH_DESCRIPTION, VX0, VY0, VZ0, AX, AY, AZ, 
+            RELEASE_POS_X, RELEASE_POS_Z, PLATE_X, PLATE_Z 컬럼 필요
+        t_decision: 스윙 결정 시점 (기본 0.25초)
+    
+    Returns:
+        DataFrame with columns: X_AT_DECISION, Y_AT_DECISION, Z_AT_DECISION
+    """
+    t_decision=0.25
+
+    # ── 홈플레이트 도달 시간 계산 ──
+    # y(t) = RELEASE_POS_Y + VY0*t + 0.5*AY*t² = 0
+    a = 0.5 * df['AY']
+    b = df['VY0']
+    c = df['RELEASE_POS_Y'] - 1.41
+
+    discriminant = b**2 - 4*a*c
+    t_plate = (-b - np.sqrt(discriminant)) / (2 * a)
+
+    # ── 궤적 공식으로 예측한 홈플레이트 좌표 ──
+    pred_plate_x = df['RELEASE_POS_X'] + df['VX0'] * t_plate + 0.5 * df['AX'] * t_plate**2
+    pred_plate_z = df['RELEASE_POS_Z'] + df['VZ0'] * t_plate + 0.5 * df['AZ'] * t_plate**2
+
+    # ── 보정 계수 ──
+    error_x = df['PLATE_X'] - pred_plate_x
+    error_z = df['PLATE_Z'] - pred_plate_z
+    correction_ratio = t_decision / t_plate
+
+    # ── 결정 시점 원시 좌표 ──
+    raw_x = df['RELEASE_POS_X'] + df['VX0'] * t_decision + 0.5 * df['AX'] * t_decision**2
+    raw_z = df['RELEASE_POS_Z'] + df['VZ0'] * t_decision + 0.5 * df['AZ'] * t_decision**2
+    raw_y = df['RELEASE_POS_Y'] + df['VY0'] * t_decision + 0.5 * df['AY'] * t_decision**2
+
+    # ── 보정 적용 ──
+    result = pd.DataFrame({
+        'X_AT_DECISION': raw_x + error_x * correction_ratio,
+        'Y_AT_DECISION': raw_y,
+        'Z_AT_DECISION': raw_z + error_z * correction_ratio,
+    }, index=df.index)
+
+    return result
+
+# 미사용 함수 
+def calc_trajectory(row, n_points=10):
+    """
+    한 투구의 궤적을 n개 시점으로 샘플링 (보정 포함)
+    
+    Parameters:
+        row: Series — VX0, VY0, VZ0, AX, AY, AZ,
+             RELEASE_POS_X, RELEASE_POS_Y, RELEASE_POS_Z,
+             PLATE_X, PLATE_Z 필요
+        n_points: 샘플링할 시점 수
+    
+    Returns:
+        numpy array, shape (n_points, 2) — 각 시점의 [x, z]
+    """
+    # ── 홈플레이트 도달 시간 계산 ──
+    a = 0.5 * row['AY']
+    b = row['VY0']
+    c = row['RELEASE_POS_Y'] - 1.41
+
+    discriminant = b**2 - 4*a*c
+    t_plate = (-b - np.sqrt(discriminant)) / (2 * a)
+
+    # ── 궤적 공식으로 예측한 홈플레이트 좌표 ──
+    pred_plate_x = row['RELEASE_POS_X'] + row['VX0'] * t_plate + 0.5 * row['AX'] * t_plate**2
+    pred_plate_z = row['RELEASE_POS_Z'] + row['VZ0'] * t_plate + 0.5 * row['AZ'] * t_plate**2
+
+    # ── 보정 계수 ──
+    error_x = row['PLATE_X'] - pred_plate_x
+    error_z = row['PLATE_Z'] - pred_plate_z
+
+    # ── n개 시점에서 보정된 좌표 계산 ──
+    times = np.linspace(0, t_plate, n_points)
+    trajectory = np.zeros((n_points, 2))
+
+    for i, t in enumerate(times):
+        ratio = t / t_plate
+        trajectory[i, 0] = row['RELEASE_POS_X'] + row['VX0'] * t + 0.5 * row['AX'] * t**2 + error_x * ratio
+        trajectory[i, 1] = row['RELEASE_POS_Z'] + row['VZ0'] * t + 0.5 * row['AZ'] * t**2 + error_z * ratio
+
+    return trajectory
+
+def build_sliding_data(df):
+        MAX_PITCH = 15
+        all_rows = []
+
+        for (gk, ab), group in df.groupby(['GAME_PK', 'AT_BAT_NUMBER']):
+            group = group.sort_values('PITCH_NUMBER')
+
+            for t in range(2, len(group) + 1):
+                history = group.iloc[:t - 1]
+                target = group.iloc[t - 1]
+
+                row = {}
+
+                # ── 이전 투구들의 원시 값 + 패딩 ──
+                for i in range(MAX_PITCH - 1):
+                    if i < len(history):
+                        pitch = history.iloc[i]
+                        for col in pitch_features:
+                            row[f'p{i+1}_{col}'] = pitch[col]
+                        row[f'p{i+1}_EXISTS'] = 1
+                    else:
+                        for col in pitch_features:
+                            row[f'p{i+1}_{col}'] = 0
+                        row[f'p{i+1}_EXISTS'] = 0
+
+                # ── 타자 반응 ──
+                for i in range(MAX_PITCH - 1):
+                    if i < len(history):
+                        row[f'p{i+1}_PITCH_DESCRIPTION'] = history.iloc[i]['PITCH_DESCRIPTION']
+                    else:
+                        row[f'p{i+1}_PITCH_DESCRIPTION'] = 'PAD'
+
+                # ── 이전 투구의 구종 라벨 ──
+                for i in range(MAX_PITCH - 1):
+                    if i < len(history):
+                        row[f'p{i+1}_IS_FF'] = 1 if history.iloc[i]['PITCH_TYPE'] == 'FF' else 0
+                        row[f'p{i+1}_IS_SL'] = 1 if history.iloc[i]['PITCH_TYPE'] == 'SL' else 0
+                    else:
+                        row[f'p{i+1}_IS_FF'] = 0
+                        row[f'p{i+1}_IS_SL'] = 0
+
+                # ── 상황 변수 ──
+                row['ACTUAL_LENGTH'] = len(history)
+                row['BALLS'] = target['BALLS']
+                row['STRIKES'] = target['STRIKES']
+                row['STAND'] = 1 if target['STAND'] == 'R' else 0
+
+                # ── 타석 식별 키 (GroupKFold용) ──
+                row['GAME_AB_KEY'] = f"{gk}_{ab}"
+
+                # ── 예측 대상 ──
+
+                row['target_TYPE'] = target['PITCH_TYPE']
+                row['target_PLATE_X'] = target['PLATE_X']
+                row['target_PLATE_Z'] = target['PLATE_Z']
+                row['target_SPEED'] = target['RELEASE_SPEED']
+                row['target_PFX_X'] = target['PFX_X']
+                row['target_PFX_Z'] = target['PFX_Z']
+                row['target_AX'] = target['AX']
+                row['target_AZ'] = target['AZ']
+                row['target_RESULT'] = target['PITCH_DESCRIPTION']
+                row['target_SZ_TOP'] = 1.5
+                row['target_SZ_BOT'] = 3.5
+
+                all_rows.append(row)
+
+        return pd.DataFrame(all_rows)
+
+def my_model(df: pd.DataFrame):
+    # 데이터 전처리 
+    pitch_features = [
+        'RELEASE_SPEED', 'AX', 'AZ',
+        'PFX_X', 'PFX_Z',
+        'RELEASE_SPIN_RATE', 
+        'X_AT_DECISION', 'Y_AT_DECISION', 'Z_AT_DECISION'
+    ]
+
+    rhp = df[(df['P_THROWS'] == 'R') & (df['PITCH_TYPE'].isin(['FF', 'SL']))]
+    rhp = rhp.sort_values(['GAME_PK', 'AT_BAT_NUMBER', 'PITCH_NUMBER'])
+    rhp['DID_SWING'] = np.where(
+        rhp['PITCH_DESCRIPTION'].isin(
+            ['swinging_strike', 'swinging_strike_blocked', 'foul',
+             'foul_tip', 'foul_bunt', 'hit_into_play']
+        ), 1, 0
+    )
+
+    col = calc_decision_point(df)
+    rhp = pd.concat([rhp, col], axis=1)
+    rhp = rhp.dropna(subset=pitch_features)
+
+    # ── PREV 원시값 ──
+    group = rhp.groupby(['GAME_PK', 'AT_BAT_NUMBER'])
+    prev_cols = ['RELEASE_SPEED', 'AX', 'AZ', 'X_AT_DECISION', 'Z_AT_DECISION', 'PLATE_X', 'PLATE_Z']
+    prev_df = group[prev_cols].shift(1).add_prefix('PREV_')
+    rhp = pd.concat([rhp, prev_df], axis=1)
+
+    # ── 궤적 괴리 비율 ──
+    rhp['MOVE_RATE'] = (rhp['PLATE_X'] - rhp['X_AT_DECISION']) / rhp['X_AT_DECISION']
+    rhp['DROP_RATE'] = (rhp['Z_AT_DECISION'] - rhp['PLATE_Z']) / rhp['Z_AT_DECISION']
+
+    # ── 직전 대비 변화량 ──
+    rhp['X_AT_DECISION_DIFF'] = rhp['X_AT_DECISION'] - rhp['PREV_X_AT_DECISION']
+    rhp['Z_AT_DECISION_DIFF'] = rhp['Z_AT_DECISION'] - rhp['PREV_Z_AT_DECISION']
+
+    # ── NaN 처리: PREV는 전체 평균으로, DIFF는 0으로 ──
+    prev_fill_cols = ['PREV_RELEASE_SPEED', 'PREV_AX', 'PREV_AZ',
+                      'PREV_X_AT_DECISION', 'PREV_Z_AT_DECISION',
+                      'PREV_PLATE_X', 'PREV_PLATE_Z']
+    for c in prev_fill_cols:
+        original = c.replace('PREV_', '')
+        rhp[c] = rhp[c].fillna(rhp[original].mean())
+
+    rhp['X_AT_DECISION_DIFF'] = rhp['X_AT_DECISION_DIFF'].fillna(0)
+    rhp['Z_AT_DECISION_DIFF'] = rhp['Z_AT_DECISION_DIFF'].fillna(0)
+    rhp['MOVE_RATE'] = rhp['MOVE_RATE'].fillna(0)
+    rhp['DROP_RATE'] = rhp['DROP_RATE'].fillna(0)
+
+    # ── 존 안/밖 판별 (타자 성향 계산용) ──
+    DZ_TOP = 4.69
+    DZ_BOT = 3.76
+    DZ_EDGE = 0.63
+
+    rhp['IN_ZONE_AT_DECISION'] = (
+        (abs(rhp['X_AT_DECISION']) <= DZ_EDGE) &
+        (rhp['Z_AT_DECISION'] >= DZ_BOT) &
+        (rhp['Z_AT_DECISION'] <= DZ_TOP)
+    ).astype(int)
+    
+    # 정렬 (타자별 시간순)
+    rhp = rhp.sort_values(['BATTER', 'GAME_PK', 'AT_BAT_NUMBER', 'PITCH_NUMBER'])
+
+    # ── 1. 타자 누적 스윙율 (과거 이력만) ──
+    rhp['BATTER_CUM_SWING'] = (
+        rhp.groupby('BATTER')['DID_SWING']
+        .apply(lambda x: x.shift(1).expanding().mean())
+        .reset_index(level=0, drop=True)
+    )
+
+    # ── 2. 존 안/밖 별 스윙율 ──
+    # 존 안 공에 대한 스윙율 (공격성)
+    rhp['IN_ZONE_SWING'] = rhp['IN_ZONE_AT_DECISION'] * rhp['DID_SWING']
+    rhp['BATTER_ZONE_SWING'] = (
+        rhp.groupby('BATTER')['IN_ZONE_SWING']
+        .apply(lambda x: x.shift(1).expanding().mean())
+        .reset_index(level=0, drop=True)
+    )
+
+    # 존 밖 공에 대한 스윙율 (선구안)
+    rhp['OUT_ZONE_SWING'] = (1 - rhp['IN_ZONE_AT_DECISION']) * rhp['DID_SWING']
+    rhp['BATTER_CHASE_RATE'] = (
+        rhp.groupby('BATTER')['OUT_ZONE_SWING']
+        .apply(lambda x: x.shift(1).expanding().mean())
+        .reset_index(level=0, drop=True)
+    )
+
+    # ── 3. 해당 타석 내 스윙율 (현재 타석의 적극성) ──
+    rhp = rhp.sort_values(['GAME_PK', 'AT_BAT_NUMBER', 'PITCH_NUMBER'])
+    rhp['AB_CUM_SWING'] = (
+        rhp.groupby(['GAME_PK', 'AT_BAT_NUMBER'])['DID_SWING']
+        .apply(lambda x: x.shift(1).expanding().mean())
+        .reset_index(level=[0, 1], drop=True)
+    )
+
+    # ── 4. 타자의 누적 투구 수 (경험치) ──
+    rhp = rhp.sort_values(['BATTER', 'GAME_PK', 'AT_BAT_NUMBER', 'PITCH_NUMBER'])
+    rhp['BATTER_PITCH_COUNT'] = rhp.groupby('BATTER').cumcount()
+
+    # ── NaN 처리 ──
+    global_swing = rhp['DID_SWING'].mean()
+    rhp['BATTER_CUM_SWING'] = rhp['BATTER_CUM_SWING'].fillna(global_swing)
+    rhp['BATTER_ZONE_SWING'] = rhp['BATTER_ZONE_SWING'].fillna(global_swing)
+    rhp['BATTER_CHASE_RATE'] = rhp['BATTER_CHASE_RATE'].fillna(global_swing)
+    rhp['AB_CUM_SWING'] = rhp['AB_CUM_SWING'].fillna(global_swing)
+
+    # 중간 계산용 컬럼 제거
+    rhp = rhp.drop(columns=['IN_ZONE_SWING', 'OUT_ZONE_SWING', 'PLATE_X', 'PLATE_Z'])
+
+    # ── 최종 feature 리스트 ──
+    model_features = [
+        'RELEASE_SPEED', 'AX', 'AZ',
+        'X_AT_DECISION', 'Z_AT_DECISION',
+        'MOVE_RATE', 'DROP_RATE',
+        'X_AT_DECISION_DIFF', 'Z_AT_DECISION_DIFF',
+        'PREV_RELEASE_SPEED', 'PREV_AX', 'PREV_AZ',
+        'PREV_X_AT_DECISION', 'PREV_Z_AT_DECISION',
+        'STRIKES', 'BALLS',
+        'PREV_PLATE_X', 'PREV_PLATE_Z',
+        # 타자 관련 features 
+        'BATTER_ZONE_SWING', 'BATTER_CHASE_RATE'
+    ]
+
+    base_df = rhp[rhp['PITCHER'] != 695243].copy()
+    miller_df = rhp[rhp['PITCHER'] == 695243].copy()
+
+    # ── 모델링 ──
+    X = base_df[model_features].copy()
+    X['STAND'] = (base_df['STAND'] == 'R').astype(int)
+    y = base_df['DID_SWING']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=.3, random_state=42)
+
+    from lightgbm import LGBMClassifier
+
+    lgbm = LGBMClassifier(
+        n_estimators=500,
+        max_depth=4,
+        learning_rate=.1,
+        num_leaves=31,
+        min_child_samples=50,
+        subsample=.7,
+        reg_alpha=1.0,
+        reg_lambda=.1,
+        colsample_bytree=.9,
+        random_state=42,
+        verbose=-1
+    )
+
+    lgbm.fit(X_train, y_train)
+    y_hat = lgbm.predict(X_test)
+
+    print(f"Train score: {lgbm.score(X_train, y_train):.4f}")
+    print(f"Test score:  {lgbm.score(X_test, y_test):.4f}")
+    print(metrics.classification_report(y_test, y_hat))
+
+
+    # ============================================
+    # 전이 학습: Mason Miller
+    # ============================================
+
+    # ── Miller 데이터 추출 (동일한 전처리 적용) ──
+    
+    print(f"Miller 전체 투구 수: {len(miller_df)}")
+    print(f"Miller 스윙 비율:")
+    print(miller_df['DID_SWING'].value_counts(normalize=True))
+
+    # ── Miller 데이터로 fine-tune ──
+    X_miller = miller_df[model_features].copy()
+    X_miller['STAND'] = (miller_df['STAND'] == 'R').astype(int)
+    y_miller = miller_df['DID_SWING']
+
+    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(
+        X_miller, y_miller, test_size=.3, random_state=42
+    )
+
+    # ===================================== 
+    # 전이 학습 (base → Miller fine-tune)   
+    # =====================================
+
+    fine_model = LGBMClassifier(
+        n_estimators=50,        # 적은 트리로 미세 조정
+        max_depth=4,
+        learning_rate=0.01,     # 작은 보폭
+        num_leaves=31,
+        min_child_samples=10,   # Miller 데이터가 적으니 완화
+        subsample=0.8,
+        colsample_bytree=0.9,
+        random_state=42,
+        verbose=-1
+    )
+    fine_model.fit(X_m_train, y_m_train, init_model=lgbm)
+    y_hat_fine = fine_model.predict(X_m_test)
+    print("=== 전이 학습 (fine-tune) ===")
+    print(f"Score: {fine_model.score(X_m_test, y_m_test):.4f}")
+    print(metrics.classification_report(y_m_test, y_hat_fine))
+
+    # ================
+    # 단순 블렌딩 기법  
+    # ================
+    
+    base_prob_miller = lgbm.predict_proba(X_m_test)[:, 1]
+    fine_prob_miller = fine_model.predict_proba(X_m_test)[:, 1]
+
+    alpha = .4
+    blend_prob = (base_prob_miller * alpha) + (fine_prob_miller * (1-alpha))
+    blend_pred = (blend_prob >= 0.5).astype(int)
+
+    print("\n=== [최종] 베이스 & 밀러 파인튜닝 블렌딩 앙상블 결과 ===")
+    print(f"Blending Test Score: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
+    print(metrics.classification_report(y_m_test, blend_pred))
+
+    # ── 개별 모델 성능 레포트 비교용 출력 ──
+    print("=== 모델별 밀러 테스트셋 단독 Accuracy 비교 ===")
+    base_invert_score = metrics.accuracy_score(y_m_test, (base_prob_miller >= 0.5).astype(int))
+    print(f"1. 순수 베이스 모델이 예측한 밀러 점수: {base_invert_score:.4f}")
+    print(f"2. 파인튜닝 단독 모델이 예측한 밀러 점수: {fine_model.score(X_m_test, y_m_test):.4f}")
+    print(f"3. 두 모델을 섞은 블렌딩 앙상블 점수: {metrics.accuracy_score(y_m_test, blend_pred):.4f}")
+    
+    # # ============
+    # # 앙상블 기법 
+    # # =============
+    # from sklearn.ensemble import StackingClassifier, RandomForestClassifier
+    # from sklearn.linear_model import LogisticRegression
+    # from xgboost import XGBClassifier
+    # from lightgbm import LGBMClassifier
+    # import time
+
+    # # ── 1차 모델들 (base estimators) ──
+    # estimators = [
+    #     ('lgbm', LGBMClassifier(
+    #         n_estimators=500,
+    #         max_depth=4,
+    #         learning_rate=0.1,
+    #         num_leaves=31,
+    #         min_child_samples=50,
+    #         subsample=0.7,
+    #         colsample_bytree=0.9,
+    #         reg_alpha=1.0,
+    #         reg_lambda=0.1,
+    #         random_state=42,
+    #         verbose=-1
+    #     )),
+    #     ('xgb', XGBClassifier(
+    #         n_estimators=300,
+    #         max_depth=4,
+    #         learning_rate=0.1,
+    #         subsample=0.7,
+    #         colsample_bytree=0.9,
+    #         random_state=42,
+    #         verbosity=0
+    #     )),
+    #     ('rf', RandomForestClassifier(
+    #         n_estimators=300,
+    #         max_depth=8,
+    #         min_samples_leaf=50,
+    #         random_state=42,
+    #         n_jobs=-1
+    #     )),
+    # ]
+
+    # # ── 2차 모델 (meta learner) ──
+    # stacking = StackingClassifier(
+    #     estimators=estimators,
+    #     final_estimator=LogisticRegression(max_iter=1000),
+    #     cv=3,               # 1차 모델의 예측을 3-Fold CV로 생성
+    #     passthrough=False,   # 원본 feature는 2차 모델에 안 넣음
+    #     n_jobs=-1,
+    #     verbose=1
+    # )
+
+    # X = rhp[model_features].copy()
+    # X['STAND'] = (rhp['STAND'] == 'R').astype(int)
+    # y = rhp['DID_SWING']
+
+    # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=.3, random_state=42)
+
+    # print("Stacking 학습 시작...")
+    # start = time.time()
+    # stacking.fit(X_train, y_train)
+    # elapsed = time.time() - start
+    # print(f"학습 완료: {elapsed/60:.1f}분")
+
+    # y_hat = stacking.predict(X_test)
+
+    # print(f"\nTrain score: {stacking.score(X_train, y_train):.4f}")
+    # print(f"Test score:  {stacking.score(X_test, y_test):.4f}")
+    # print(metrics.classification_report(y_test, y_hat))
+
+    # # ── 개별 모델과 비교 ──
+    # print("\n=== 개별 모델 vs Stacking 비교 ===")
+    # for name, model in zip(['lgbm', 'xgb', 'rf'], stacking.estimators_):
+    #     score = model.score(X_test, y_test)
+    #     print(f"  {name:>6}: {score:.4f}")
+    # print(f"  stack: {stacking.score(X_test, y_test):.4f}")
+
 if __name__ == "__main__":
     try:
         conn = DB.connect(user="C##AKSEN", password="1234", dsn="localhost:1521/xe")
@@ -559,7 +1116,9 @@ if __name__ == "__main__":
         # hit_distance_analysis(df)
         # pfx_z_analysis(df)
         # pitch_type_classification(df)
-        boosting(df)
+        # Masson_Miller(df)    
+        my_model(df)
+
 
     except Exception as e:
         traceback.print_exc()
